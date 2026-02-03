@@ -16,10 +16,11 @@
 #include "GCNRegPressure.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
+#include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineScheduler.h"
-#include <cstdint>
-#include <limits>
 
 namespace llvm {
 
@@ -30,11 +31,12 @@ class GCNSchedStage;
 
 enum class GCNSchedStageID : unsigned {
   OccInitialSchedule = 0,
-  UnclusteredHighRPReschedule = 1,
-  ClusteredLowOccupancyReschedule = 2,
-  PreRARematerialize = 3,
-  ILPInitialSchedule = 4,
-  MemoryClauseInitialSchedule = 5
+  RewriteMFMAForm = 1,
+  UnclusteredHighRPReschedule = 2,
+  ClusteredLowOccupancyReschedule = 3,
+  PreRARematerialize = 4,
+  ILPInitialSchedule = 5,
+  MemoryClauseInitialSchedule = 6
 };
 
 #ifndef NDEBUG
@@ -200,8 +202,7 @@ public:
 };
 
 inline raw_ostream &operator<<(raw_ostream &OS, const ScheduleMetrics &Sm) {
-  dbgs() << "\n Schedule Metric (scaled by "
-         << ScheduleMetrics::ScaleFactor
+  dbgs() << "\n Schedule Metric (scaled by " << ScheduleMetrics::ScaleFactor
          << " ) is: " << Sm.getMetric() << " [ " << Sm.getBubbles() << "/"
          << Sm.getLength() << " ]\n";
   return OS;
@@ -241,6 +242,7 @@ using RegionBoundaries =
 class GCNScheduleDAGMILive final : public ScheduleDAGMILive {
   friend class GCNSchedStage;
   friend class OccInitialScheduleStage;
+  friend class RewriteMFMAFormStage;
   friend class UnclusteredHighRPStage;
   friend class ClusteredLowOccStage;
   friend class PreRARematStage;
@@ -301,6 +303,9 @@ class GCNScheduleDAGMILive final : public ScheduleDAGMILive {
 
   // Compute and cache live-ins and pressure for all regions in block.
   void computeBlockPressure(unsigned RegionIdx, const MachineBasicBlock *MBB);
+
+  /// Makes the scheduler try to achieve an occupancy of \p TargetOccupancy.
+  void setTargetOccupancy(unsigned TargetOccupancy);
 
   void runSchedStages();
 
@@ -363,11 +368,11 @@ public:
   // be skipped.
   virtual bool initGCNRegion();
 
+  // Finalize state after scheduling a region.
+  virtual void finalizeGCNRegion();
+
   // Track whether a new region is also a new MBB.
   void setupNewBlock();
-
-  // Finalize state after scheudling a region.
-  void finalizeGCNRegion();
 
   // Check result of scheduling.
   void checkScheduling();
@@ -393,8 +398,12 @@ public:
   // Returns true if the new schedule may result in more spilling.
   bool mayCauseSpilling(unsigned WavesAfter);
 
-  // Attempt to revert scheduling for this region.
-  void revertScheduling();
+  /// Sets the schedule of region \p RegionIdx in block \p MBB to \p MIOrder.
+  /// The MIs in \p MIOrder must be exactly the same as the ones currently
+  /// existing inside the region, only in a different order that honors def-use
+  /// chains.
+  void modifyRegionSchedule(unsigned RegionIdx, MachineBasicBlock *MBB,
+                            ArrayRef<MachineInstr *> MIOrder);
 
   void advanceRegion() { RegionIdx++; }
 
@@ -406,6 +415,59 @@ public:
   bool shouldRevertScheduling(unsigned WavesAfter) override;
 
   OccInitialScheduleStage(GCNSchedStageID StageID, GCNScheduleDAGMILive &DAG)
+      : GCNSchedStage(StageID, DAG) {}
+};
+
+class RewriteMFMAFormStage : public GCNSchedStage {
+private:
+  // Record regions with excess archvgpr register pressure over the physical
+  // register limit. Register pressure in these regions usually will result in
+  // spilling.
+  BitVector RegionsWithExcessArchVGPR;
+
+  const SIInstrInfo *TII;
+  const SIRegisterInfo *SRI;
+
+  /// Do a speculative rewrite and collect copy locations. The speculative
+  /// rewrite allows us to calculate the RP of the code after the rewrite, and
+  /// the copy locations allow us to calculate the total cost of copies required
+  /// for the rewrite. Stores the rewritten instructions in \p RewriteCands ,
+  /// the copy locations for uses (of the MFMA result) in \p CopyForUse and the
+  /// copy locations for defs (of the MFMA operands) in \p CopyForDef
+  bool
+  initHeuristics(std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands,
+                 DenseMap<MachineBasicBlock *, std::set<Register>> &CopyForUse,
+                 SmallPtrSetImpl<MachineInstr *> &CopyForDef);
+
+  /// Calculate the rewrite cost and undo the state change (e.g. rewriting) done
+  /// in initHeuristics. Uses \p CopyForUse and \p CopyForDef to calculate copy
+  /// costs, and \p RewriteCands to undo rewriting.
+  int64_t getRewriteCost(
+      const std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands,
+      const DenseMap<MachineBasicBlock *, std::set<Register>> &CopyForUse,
+      const SmallPtrSetImpl<MachineInstr *> &CopyForDef);
+
+  /// Do the final rewrite on \p RewriteCands and insert any needed copies.
+  bool
+  rewrite(const std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands);
+
+  /// \returns true if this MI is a rewrite candidate.
+  bool isRewriteCandidate(MachineInstr *MI) const;
+
+  /// Finds all the reaching defs of \p UseMO and stores the SlotIndexes into \p
+  /// DefIdxs
+  void findReachingDefs(MachineOperand &UseMO, LiveIntervals *LIS,
+                        SmallVectorImpl<SlotIndex> &DefIdxs);
+
+  /// Finds all the reaching uses of \p DefMI and stores the use operands in \p
+  /// ReachingUses
+  void findReachingUses(MachineInstr *DefMI, LiveIntervals *LIS,
+                        SmallVectorImpl<MachineOperand *> &ReachingUses);
+
+public:
+  bool initGCNSchedStage() override;
+
+  RewriteMFMAFormStage(GCNSchedStageID StageID, GCNScheduleDAGMILive &DAG)
       : GCNSchedStage(StageID, DAG) {}
 };
 
@@ -592,20 +654,8 @@ private:
     int64_t getFreqDiff(const FreqInfo &Freq) const;
   };
 
-  /// Holds enough information to rollback a rematerialization decision post
-  /// re-scheduling.
-  struct RollbackInfo {
-    /// The rematerializable register under consideration.
-    const RematReg *Remat;
-    /// The rematerialized MI replacing the original defining MI.
-    MachineInstr *RematMI;
-
-    RollbackInfo(const RematReg *Remat) : Remat(Remat) {}
-  };
-
   /// Parent MBB to each region, in region order.
   SmallVector<MachineBasicBlock *> RegionBB;
-
   /// Register pressure targets for all regions.
   SmallVector<GCNRPTarget> RPTargets;
   /// Regions which are above the stage's RP target.
@@ -614,17 +664,51 @@ private:
   /// objective is spilling reduction.
   std::optional<unsigned> TargetOcc;
   /// Achieved occupancy *only* through rematerializations (pre-rescheduling).
-  /// Smaller than or equal to the target occupancy, when it is defined.
   unsigned AchievedOcc;
-
-  /// List of rematerializable registers.
-  SmallVector<RematReg> RematRegs;
-  /// List of rematerializations to rollback if rematerialization does not end
-  /// up being beneficial.
-  SmallVector<RollbackInfo> Rollbacks;
   /// After successful stage initialization, indicates which regions should be
   /// rescheduled.
   BitVector RescheduleRegions;
+
+  /// List of rematerializable registers.
+  SmallVector<RematReg> RematRegs;
+
+  /// Holds enough information to rollback a rematerialization decision post
+  /// re-scheduling.
+  struct RollbackInfo {
+    /// The rematerializable register under consideration.
+    const RematReg *Remat;
+    /// The rematerialized MI replacing the original defining MI.
+    MachineInstr *RematMI;
+    /// Maps register machine operand indices to their original register.
+    SmallDenseMap<unsigned, Register, 4> RegMap;
+
+    RollbackInfo(const RematReg *Remat) : Remat(Remat) {}
+  };
+  /// List of rematerializations to rollback if rematerialization does not end
+  /// up being beneficial.
+  SmallVector<RollbackInfo> Rollbacks;
+
+  /// State of a region pre-re-scheduling but post-rematerializations that we
+  /// must keep to be able to revert re-scheduling effects.
+  struct RegionSchedRevert {
+    /// Region number;
+    unsigned RegionIdx;
+    /// Original instruction order (both debug and non-debug MIs).
+    std::vector<MachineInstr *> OrigMIOrder;
+    /// Maximum pressure recorded in the region.
+    GCNRegPressure MaxPressure;
+
+    RegionSchedRevert(unsigned RegionIdx, ArrayRef<MachineInstr *> OrigMIOrder,
+                      const GCNRegPressure &MaxPressure)
+        : RegionIdx(RegionIdx), OrigMIOrder(OrigMIOrder),
+          MaxPressure(MaxPressure) {}
+  };
+  /// After re-scheduling, contains pre-re-scheduling data for all re-scheduled
+  /// regions.
+  SmallVector<RegionSchedRevert> RegionReverts;
+
+  /// Returns the occupancy the stage is trying to achieve.
+  unsigned getStageTargetOccupancy() const;
 
   /// Determines the stage's objective (increasing occupancy or reducing
   /// spilling, set in \ref TargetOcc). Defines \ref RPTargets in all regions to
@@ -656,9 +740,12 @@ private:
 
   /// Rollbacks the rematerialization decision represented by \p Rollback. This
   /// update live-in/out lists in the DAG but does not update cached register
-  /// pressures. Regions in which RP may be impacted are marked in \ref
-  /// RecomputeRP.
-  void rollback(const RollbackInfo &Rollback, BitVector &RecomputeRP) const;
+  /// pressures.
+  void rollback(const RollbackInfo &Rollback) const;
+
+  /// Deletes all rematerialized MIs from the MIR when they were kept around for
+  /// potential rollback.
+  void commitRematerializations() const;
 
   /// Whether the MI is rematerializable
   bool isReMaterializable(const MachineInstr &MI);
@@ -672,6 +759,8 @@ public:
   bool initGCNSchedStage() override;
 
   bool initGCNRegion() override;
+
+  void finalizeGCNRegion() override;
 
   bool shouldRevertScheduling(unsigned WavesAfter) override;
 
